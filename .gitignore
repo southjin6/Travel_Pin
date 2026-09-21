@@ -6,3 +6,7 @@ venv/
 .venv/
 server.log
 *.log
+
+# Scratch databases: the pre-accounts backup and migration rehearsal copies.
+travel_backup.db
+travel_test.db

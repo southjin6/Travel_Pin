@@ -1,21 +1,29 @@
 """Interactive Travel Bucket List & Map Planner.
 
-A small Flask app that stores destination pins in SQLite, renders them as
-summary cards (with country flags from the REST Countries API) alongside an
-interactive Leaflet/OpenStreetMap map.
+A small Flask app that keeps a per-account list of destination pins in SQLite
+and renders them as summary cards (with country flags from the REST Countries
+API) alongside an interactive Leaflet/OpenStreetMap map. Sign-in, open
+registration and an administrator who can reset a forgotten password are built
+on Flask, Werkzeug and the standard library alone.
 """
 
+import functools
 import json
 import math
 import os
+import re
+import secrets
 import sqlite3
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
 from urllib.parse import quote, unquote, urlparse
 
 import requests
-from flask import Flask, flash, g, jsonify, redirect, render_template, request, url_for
+from flask import (Flask, abort, flash, g, jsonify, redirect, render_template,
+                   request, session, url_for)
+from werkzeug.security import check_password_hash, generate_password_hash
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -41,10 +49,38 @@ def _load_env_file(path=os.path.join(BASE_DIR, ".env")):
 _load_env_file()
 
 app = Flask(__name__)
-app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-travel-bucket-key")
 
-DATABASE = os.path.join(BASE_DIR, "travel.db")
+# The signing key turns session cookies into credentials, so a shared default
+# would let anyone forge an admin's cookie. Refuse to start rather than fall
+# back to one: generate yours with
+#   python -c "import secrets; print(secrets.token_hex(32))"
+# and put it in .env (see .env.example).
+SECRET_KEY = os.environ.get("SECRET_KEY")
+if not SECRET_KEY:
+    raise SystemExit(
+        "SECRET_KEY is not set. Add it to .env (or the environment) as the "
+        "output of:  python -c \"import secrets; print(secrets.token_hex(32))\""
+    )
+app.config["SECRET_KEY"] = SECRET_KEY
+# Cookies carry the login, so they are unreadable to scripts and withheld from
+# other sites' top-level posts; HTTPS-only is opt-in because local dev is plain http.
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_SECURE"] = bool(os.environ.get("SESSION_COOKIE_SECURE"))
+# Only applies to a session marked `permanent` (the "remember me" checkbox).
+app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=30)
+# Every form in this app is a few hundred characters of text, so Werkzeug's own
+# 500 KB field ceiling is still two orders of magnitude more than a real
+# submission. Bound the request body so an oversized one is refused outright.
+app.config["MAX_CONTENT_LENGTH"] = 64 * 1024
+
+# TRAVEL_DB lets the migration be rehearsed against a copy instead of the real
+# file, which is the only safe way to test a schema change in place.
+DATABASE = os.environ.get("TRAVEL_DB") or os.path.join(BASE_DIR, "travel.db")
 SCHEMA = os.path.join(BASE_DIR, "schema.sql")
+# The schema version this code expects. Each step in _upgrade_schema() brings a
+# database one version closer to it; never edit an old step, add a new one.
+SCHEMA_VERSION = 2
 
 # REST Countries v5 (the legacy v3.1 endpoint has been deprecated). Live data
 # requires a personal API key from https://restcountries.com/sign-up; set it via
@@ -63,20 +99,14 @@ API_HEADERS = {"User-Agent": "TravelBucketList/1.0 (CS50x final project)"}
 COUNTRIES_HEADERS = {**API_HEADERS, "Authorization": f"Bearer {RESTCOUNTRIES_API_KEY}"}
 
 # The planner is scoped to the Philippines: only Philippine destinations are
-# allowed, and the map opens centred on the country.
+# allowed, and the map is bounded by the same box (PH_BOUNDS in script.js,
+# which maxBounds enforces on a click).
 PH_COUNTRY_CODE = "ph"
 PH_COUNTRY_NAME = "Philippines"
-PH_CENTER = [12.8797, 121.7740]
-PH_ZOOM = 6
-
-# Sample Philippine destinations seeded on first run (city, lat, lng, notes).
-SEED_DESTINATIONS = [
-    ("Manila", 14.5995, 120.9842, "Intramuros, Rizal Park, baywalk food crawl"),
-    ("Cebu City", 10.3157, 123.8854, "Base for Moal Boal whale sharks & Oslob falls"),
-    ("Puerto Princesa", 9.7392, 118.7360, "Palawan: Underground River & island hopping"),
-    ("Baguio", 16.4023, 120.5960, "Summer capital — cool climate, night market"),
-    ("Boracay", 11.9674, 121.9256, "White Beach, sunset sails, paragliding"),
-]
+# The coordinate limits are checked in /add as well, because there the form is
+# client-supplied: the country name proves nothing about the numbers beside it.
+PH_LAT_MIN, PH_LAT_MAX = 4.0, 21.3
+PH_LNG_MIN, PH_LNG_MAX = 117.0, 126.7
 
 
 def _is_philippines(country, code):
@@ -106,23 +136,623 @@ def close_db(exception=None):
 
 
 def init_db():
-    """Create tables, drop non-Philippine pins, and seed sample PH destinations."""
-    db = sqlite3.connect(DATABASE)
-    with open(SCHEMA, "r", encoding="utf-8") as f:
-        db.executescript(f.read())
-    # Focus: remove any destination that is not in the Philippines.
-    db.execute("DELETE FROM destinations WHERE LOWER(country_code) != ?", (PH_COUNTRY_CODE,))
-    # Seed sample Philippine destinations when the list is empty.
-    if db.execute("SELECT COUNT(*) FROM destinations").fetchone()[0] == 0:
-        db.executemany(
-            """INSERT INTO destinations
-               (city, country, country_code, latitude, longitude, visited_status, notes)
-               VALUES (?, ?, ?, ?, ?, 'wishlist', ?)""",
-            [(city, PH_COUNTRY_NAME, PH_COUNTRY_CODE, lat, lon, notes)
-             for city, lat, lon, notes in SEED_DESTINATIONS],
+    """Create the schema, bring an older database up to date, keep pins Philippine.
+
+    Runs once, from the `__main__` block. `CREATE TABLE IF NOT EXISTS` cannot add
+    a column to a table that already exists, so anything written by an earlier
+    version of this code needs the explicit steps in `_upgrade_schema`.
+    """
+    db = sqlite3.connect(DATABASE, timeout=10)
+    try:
+        # Set before the schema runs: this connection is one of several that do
+        # not go through get_db(), and CASCADE only fires where the pragma is on.
+        db.execute("PRAGMA foreign_keys = ON")
+        with open(SCHEMA, "r", encoding="utf-8") as f:
+            db.executescript(f.read())
+        _upgrade_schema(db)
+        # Focus: remove any destination that is not in the Philippines.
+        db.execute("DELETE FROM destinations WHERE LOWER(country_code) != ?", (PH_COUNTRY_CODE,))
+        db.execute("CREATE INDEX IF NOT EXISTS idx_destinations_user ON destinations(user_id)")
+        db.commit()
+    finally:
+        db.close()
+
+
+def _upgrade_schema(db):
+    """Run every migration step this database has not been through yet.
+
+    Version-gated rather than "migrate once if unversioned", because a table can
+    be older than the file it lives in: `CREATE TABLE IF NOT EXISTS` creates
+    `login_attempts` in its *current* shape on a fresh database and then leaves
+    that table alone forever, so a file first created against an earlier draft of
+    schema.sql keeps whichever columns it started with. Each step stamps its own
+    version, so an interrupted run is finished on the next start.
+    """
+    if int(_meta_get(db, "schema_version") or 0) < 1:
+        _migrate_to_v1(db)
+    if int(_meta_get(db, "schema_version") or 0) < 2:
+        _migrate_to_v2(db)
+    # Read back rather than trusting the local count: a step that forgot to stamp
+    # would otherwise look like a success and leave the next version's code
+    # running against half-migrated tables.
+    version = int(_meta_get(db, "schema_version") or 0)
+    if version != SCHEMA_VERSION:
+        raise RuntimeError(
+            f"database is at schema_version {version} but this code needs "
+            f"{SCHEMA_VERSION}; add a migration step rather than editing an old one."
         )
+
+
+def _meta_get(db, key):
+    row = db.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else None
+
+
+def _meta_set(db, key, value):
+    db.execute(
+        """INSERT INTO meta (key, value) VALUES (?, ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+        (key, str(value)),
+    )
+
+
+def _ensure_admin(db):
+    """Return the id of the recovery admin, creating it from ADMIN_PASSWORD once.
+
+    Every database has exactly one of these, whether it is brand new or predates
+    accounts, because it is the account that hands out password resets. After the
+    row exists the environment variable is never read again, so the app stays
+    runnable with ADMIN_PASSWORD removed from .env.
+    """
+    username = (os.environ.get("ADMIN_USERNAME") or "admin").strip() or "admin"
+    # Validated rather than trusted: this name comes from .env, not the sign-up
+    # form, so it is the one username that could otherwise reach a template
+    # without passing the pattern every other account is held to.
+    if not USERNAME_RE.match(username):
+        raise SystemExit(f"ADMIN_USERNAME {username!r} is not a valid username: "
+                         "3-20 characters, letters, digits and ._- only.")
+    row = db.execute("SELECT id, is_admin FROM users WHERE username = ?",
+                     (username,)).fetchone()
+    if row:
+        # Indexed, not by name: init_db() opens this connection without a
+        # row_factory, which is why every other query in a migration step reads
+        # row[0] as well.
+        if not row[1]:
+            # Registration is open, so an ordinary account may already own this
+            # name by the time the app first boots. Returning its id here would
+            # quietly make that account the recovery admin the migration below
+            # hands every pre-accounts pin to, so this refuses instead.
+            raise SystemExit(
+                f"The username {username!r} belongs to a non-admin account, so the "
+                "recovery admin cannot be created. Set ADMIN_USERNAME to a name "
+                "nobody has registered and run this again."
+            )
+        return row[0]
+    password = os.environ.get("ADMIN_PASSWORD") or ""
+    if not password:
+        raise SystemExit(
+            "No admin account exists yet and ADMIN_PASSWORD is not set.\n"
+            "    1. Set ADMIN_PASSWORD in .env (see .env.example) to the password "
+            "you want for the '" + username + "' recovery account.\n"
+            "    2. Run this again, then empty the value so it is only read once."
+        )
+    error = _password_error(password)
+    if error:
+        raise SystemExit(f"ADMIN_PASSWORD is not usable: {error}")
+    db.execute(
+        "INSERT INTO users (username, password_hash, is_admin) VALUES (?, ?, 1)",
+        (username, generate_password_hash(password)),
+    )
+    return db.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()[0]
+
+
+def _migrate_to_v1(db):
+    """Give an existing database owners: add user_id and adopt the pins it holds.
+
+    Also covers a fresh file, where each step simply does nothing. Every step is
+    idempotent and the whole thing is one transaction, so a database left half
+    migrated (an earlier crash, an interrupted run) is finished rather than
+    duplicated — and a failure rolls back instead of stranding pins.
+    """
+    with db:  # commit on success, roll back on any raise below
+        columns = [row[1] for row in db.execute("PRAGMA table_info(destinations)")]
+        if "user_id" not in columns:
+            # SQLite forbids NOT NULL here without a constant default, and a
+            # default of 0 would point at a user that cannot exist, so the
+            # "every pin has an owner" rule is enforced in Python instead: see
+            # get_owned_destination() and the NULL check at the end of this function.
+            db.execute("ALTER TABLE destinations ADD COLUMN user_id INTEGER "
+                       "REFERENCES users(id) ON DELETE CASCADE")
+        admin_id = _ensure_admin(db)
+        # Pins written before accounts existed belong to nobody; hand them to the
+        # admin, who can pass each one on from the admin page.
+        db.execute("UPDATE destinations SET user_id = ? WHERE user_id IS NULL", (admin_id,))
+        ownerless = db.execute(
+            "SELECT COUNT(*) FROM destinations WHERE user_id IS NULL").fetchone()[0]
+        if ownerless:
+            raise RuntimeError(
+                f"{ownerless} destination(s) still have no owner after migration; "
+                "nothing was changed."
+            )
+        _meta_set(db, "schema_version", 1)
+
+
+def _migrate_to_v2(db):
+    """Give a pre-existing login_attempts table the sliding-window column.
+
+    `count` alone cannot tell five failures in a minute from five spread over a
+    week, which is what `last_failure` is for — so a table created before that
+    column existed makes every login and every registration raise
+    "no such column: last_failure". A fresh database never comes here: schema.sql
+    already creates the column, and the check below then does nothing.
+    """
+    with db:
+        columns = [row[1] for row in db.execute("PRAGMA table_info(login_attempts)")]
+        if "last_failure" not in columns:
+            # Unlike user_id, a constant default is both legal and correct here:
+            # 0 means "the window opened with the next attempt", which is how an
+            # already-cooling-down row should behave. locked_until is untouched,
+            # so no lockout is shortened or extended by this step.
+            db.execute("ALTER TABLE login_attempts "
+                       "ADD COLUMN last_failure REAL NOT NULL DEFAULT 0")
+        _meta_set(db, "schema_version", 2)
+
+
+# --------------------------------------------------------------------------- #
+# Accounts
+#
+# Written by hand against Flask, Werkzeug and the stdlib: this machine has no
+# pip, so Flask-Login, Flask-WTF and bcrypt are not options. Werkzeug's
+# generate_password_hash already defaults to scrypt, which is the part worth
+# getting right.
+# --------------------------------------------------------------------------- #
+# The upper bound is not pedantry: scrypt's cost scales with the input, so
+# hashing an unbounded password is a cheap way to keep a server busy.
+PASSWORD_MIN, PASSWORD_MAX = 8, 200
+USERNAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{2,19}\Z")
+LOGIN_WINDOW_S, LOGIN_MAX_FAILS, LOGIN_LOCKOUT_S = 15 * 60, 5, 15 * 60
+REGISTER_WINDOW_S, REGISTER_MAX, REGISTER_LOCKOUT_S = 60 * 60, 10, 60 * 60
+FLASH_GENERIC_LOGIN_ERROR = "Invalid username or password."
+
+
+def _password_error(password):
+    """Return a message for a usable-but-too-short/long password, else None."""
+    if len(password) < PASSWORD_MIN:
+        return f"Password must be at least {PASSWORD_MIN} characters."
+    if len(password) > PASSWORD_MAX:
+        return f"Password must be at most {PASSWORD_MAX} characters."
+    return None
+
+
+def _lockout_remaining(db, key):
+    """Seconds left on a cool-down for `key`, or 0 when it is not cooling down."""
+    row = db.execute("SELECT locked_until FROM login_attempts WHERE key = ?",
+                     (key,)).fetchone()
+    if row:
+        left = row["locked_until"] - time.time()
+        if left > 0:
+            return int(math.ceil(left))
+    return 0
+
+
+def _note_failure(db, key, max_fails, window_s, lockout_s):
+    """Record one refused attempt, locking `key` once the window is exhausted.
+
+    Wall-clock time and a table, not a counter in memory: every in-process
+    structure in this file is wiped by the debug reloader, and a lockout that
+    resets whenever the app restarts is not a lockout.
+    """
+    now = time.time()
+    row = db.execute("SELECT count, last_failure FROM login_attempts WHERE key = ?",
+                     (key,)).fetchone()
+    count = 0 if row is None or now - row["last_failure"] > window_s else row["count"]
+    count += 1
+    locked_until = 0.0
+    if count >= max_fails:
+        locked_until, count = now + lockout_s, 0
+    db.execute(
+        """INSERT OR REPLACE INTO login_attempts (key, count, locked_until, last_failure)
+           VALUES (?, ?, ?, ?)""",
+        (key, count, locked_until, now),
+    )
+
+
+def _clear_failures(db, *keys):
+    for key in keys:
+        db.execute("DELETE FROM login_attempts WHERE key = ?", (key,))
+
+
+@app.before_request
+def load_logged_in_user():
+    """Put the signed-in user (or None) on `g` for every request.
+
+    The cookie only ever holds an id and the session_version that was current
+    when it was minted. Comparing them on each read is what lets a password
+    reset, an account being disabled, or a change of one's own password end a
+    live session immediately — a signed cookie cannot be recalled, so this is
+    the standing revocation check that replaces a server-side session store.
+    """
+    g.user = None
+    user_id = session.get("user_id")
+    if user_id is None:
+        return
+    row = get_db().execute(
+        "SELECT id, username, is_admin, is_active, session_version "
+        "FROM users WHERE id = ?", (user_id,)).fetchone()
+    if (row is None or not row["is_active"]
+            or row["session_version"] != session.get("sv")):
+        session.clear()
+        return
+    g.user = dict(row)
+
+
+def login_required(view):
+    """Gate a route on a live session; send API and page callers different hints."""
+    @functools.wraps(view)
+    def wrapped(**kwargs):
+        if getattr(g, "user", None):
+            return view(**kwargs)
+        # The JSON APIs are fetch()ed by script.js, which reads `error`; a
+        # redirect would hand it an HTML login page and a confusing 200.
+        if request.path.startswith("/api/"):
+            return jsonify({"error": "login required"}), 401
+        flash("Please sign in to continue.", "error")
+        return redirect(url_for("login", next=request.path))
+    return wrapped
+
+
+def admin_required(view):
+    """Gate a route on the admin flag. A refused non-admin sees the home page."""
+    @functools.wraps(view)
+    def wrapped(**kwargs):
+        if getattr(g, "user", None) and g.user["is_admin"]:
+            return view(**kwargs)
+        flash("That page is only available to an administrator.", "error")
+        return redirect(url_for("index"))
+    return wrapped
+
+
+def _safe_next(target):
+    """Accept a post-login redirect only if it is a path on this site.
+
+    The second character has to be checked as well, not just the leading slash:
+    a browser reads both "//host/" and "/\\host/" as an absolute URL at another
+    host, so either one would turn a login form into an off-site redirect.
+    Control characters are refused because the value becomes a response header,
+    where Werkzeug rejects a newline by raising rather than sanitising it.
+    """
+    if (target and target[0] == "/" and target[1:2] not in ("/", "\\")
+            and not any(ch < " " or ch == "\x7f" for ch in target)):
+        return target
+    return url_for("index")
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    """Sign in, spending the expensive hash only for an address that is not cooling down."""
+    if getattr(g, "user", None):
+        return redirect(url_for("index"))
+    if request.method == "GET":
+        return render_template("login.html", next=request.args.get("next") or "")
+
+    username = (request.form.get("username") or "").strip()
+    password = request.form.get("password") or ""
+    db = get_db()
+    user_key, ip_key = "u:" + username.lower(), "i:" + (request.remote_addr or "?")
+    remaining = max(_lockout_remaining(db, user_key), _lockout_remaining(db, ip_key))
+    if remaining:
+        flash(f"Too many failed attempts. Try again in {remaining} seconds.", "error")
+        return render_template("login.html", next=request.form.get("next") or "")
+
+    row = db.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+    # Unknown name, wrong password and disabled account all take this one path
+    # with this one message, so the form cannot be used to list usernames. An
+    # over-long password is refused by the first test, which short-circuits
+    # before the hasher: scrypt's cost grows with its input, and this is the one
+    # place a password of any length at all reaches it (register and /account
+    # both bound theirs with _password_error first).
+    if (len(password) > PASSWORD_MAX or row is None
+            or not check_password_hash(row["password_hash"], password)
+            or not row["is_active"]):
+        _note_failure(db, user_key, LOGIN_MAX_FAILS, LOGIN_WINDOW_S, LOGIN_LOCKOUT_S)
+        _note_failure(db, ip_key, LOGIN_MAX_FAILS, LOGIN_WINDOW_S, LOGIN_LOCKOUT_S)
+        db.commit()
+        flash(FLASH_GENERIC_LOGIN_ERROR, "error")
+        return render_template("login.html", next=request.form.get("next") or "")
+
+    # Clearing first drops the anonymous session's flash queue and CSRF token;
+    # nothing from before the sign-in survives into it.
+    session.clear()
+    session["user_id"] = row["id"]
+    session["sv"] = row["session_version"]
+    session.permanent = bool(request.form.get("remember"))
+    # Only the account's own counter is cleared. The per-address one is not:
+    # sign-ups are free, so wiping it on every success would let anyone spend a
+    # few guesses at somebody else's username and then erase the evidence by
+    # signing in to an account of their own. It expires on its own instead.
+    _clear_failures(db, user_key)
     db.commit()
-    db.close()
+    flash(f"Welcome back, {row['username']}.", "success")
+    return redirect(_safe_next(request.form.get("next")))
+
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    """Open self-registration: a new account starts with an empty bucket list."""
+    if getattr(g, "user", None):
+        return redirect(url_for("index"))
+    if request.method == "GET":
+        return render_template("register.html")
+
+    db = get_db()
+    ip_key = "r:" + (request.remote_addr or "?")
+    remaining = _lockout_remaining(db, ip_key)
+    if remaining:
+        flash("Too many accounts created from here. Try again later.", "error")
+        return render_template("register.html")
+
+    username = (request.form.get("username") or "").strip()
+    password = request.form.get("password") or ""
+    error = None
+    if not USERNAME_RE.match(username):
+        error = ("Username must be 3-20 characters: letters, digits and "
+                 "._- only, starting with a letter or digit.")
+    if error is None:
+        error = _password_error(password)
+    if request.form.get("confirm") != password:
+        error = error or "The two passwords do not match."
+    if error:
+        flash(error, "error")
+        return render_template("register.html")
+
+    # Every attempt counts, including successful ones: open registration is
+    # unlimited by design, so an address has to run out at some point.
+    _note_failure(db, ip_key, REGISTER_MAX, REGISTER_WINDOW_S, REGISTER_LOCKOUT_S)
+    try:
+        # Inserted blind instead of checked first: a pre-check would be a
+        # TOCTOU race and, worse, a timing oracle for username existence.
+        db.execute("INSERT INTO users (username, password_hash) VALUES (?, ?)",
+                   (username, generate_password_hash(password)))
+    except sqlite3.IntegrityError:
+        db.commit()
+        # Availability is already probeable by anyone who can reach this form, so
+        # the useful message here is the true one; the throttle limits the probing.
+        flash("That username is already taken.", "error")
+        return render_template("register.html")
+    db.commit()
+
+    row = db.execute("SELECT id, session_version FROM users WHERE username = ?",
+                     (username,)).fetchone()
+    session.clear()
+    session["user_id"] = row["id"]
+    session["sv"] = row["session_version"]
+    flash("Account created. Your bucket list starts empty.", "success")
+    return redirect(url_for("index"))
+
+
+@app.route("/logout", methods=["POST"])
+@login_required
+def logout():
+    """Forget this browser's session. A POST, so the CSRF check applies to it too."""
+    session.clear()
+    flash("Signed out.", "success")
+    return redirect(url_for("index"))
+
+
+@app.route("/account", methods=["GET", "POST"])
+@login_required
+def account():
+    """Change your own password, which also signs out your other devices."""
+    if request.method == "GET":
+        return render_template("account.html")
+
+    db = get_db()
+    row = db.execute("SELECT * FROM users WHERE id = ?", (g.user["id"],)).fetchone()
+    current = request.form.get("current_password") or ""
+    new = request.form.get("new_password") or ""
+    error = None
+    if not check_password_hash(row["password_hash"], current):
+        error = "That is not your current password."
+    if error is None:
+        error = _password_error(new)
+    if error is None and new != (request.form.get("confirm") or ""):
+        error = "The two new passwords do not match."
+    if error:
+        flash(error, "error")
+        return render_template("account.html")
+
+    db.execute("UPDATE users SET password_hash = ?, session_version = session_version + 1 "
+               "WHERE id = ?", (generate_password_hash(new), row["id"]))
+    # Read the bumped value back rather than assuming it: the new number has to go
+    # into this tab's cookie, or the row update would log this tab out as well.
+    db.commit()
+    session["sv"] = db.execute("SELECT session_version FROM users WHERE id = ?",
+                               (row["id"],)).fetchone()["session_version"]
+    flash("Password changed. Other devices signed in to this account are now out.",
+          "success")
+    return redirect(url_for("index"))
+
+
+# --------------------------------------------------------------------------- #
+# Admin: recovery for accounts, and nothing else
+#
+# Admins have no access to anyone's pins — / stays strictly user_id = me for
+# them too. The role exists to hand out a new password to someone who forgot
+# theirs and to stop an account that is misbehaving; an admin can never take an
+# action on their own account, so they cannot lock themselves out of it either.
+# --------------------------------------------------------------------------- #
+def _admin_target(db, user_id):
+    """Return (row, error) for an admin acting on another account.
+
+    Refusing to act on one's own account is also the lockout guard: the signed-in
+    admin is active and is never the target, so no action here can leave the app
+    without somebody who can reset a password.
+    """
+    if user_id == g.user["id"]:
+        return None, "That action is not available on your own account."
+    row = db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    if row is None:
+        return None, "That user no longer exists."
+    return row, None
+
+
+@app.route("/admin")
+@admin_required
+def admin():
+    """List accounts, with each one's pin count and the actions an admin can take."""
+    db = get_db()
+    users = db.execute(
+        """SELECT u.*, COUNT(d.id) AS pin_count
+           FROM users u LEFT JOIN destinations d ON d.user_id = u.id
+           GROUP BY u.id ORDER BY u.username""").fetchall()
+    my_pins = db.execute("SELECT id, city FROM destinations WHERE user_id = ? "
+                         "ORDER BY created_at DESC", (g.user["id"],)).fetchall()
+    return render_template("admin.html", users=[dict(u) for u in users], my_pins=my_pins)
+
+
+@app.route("/admin/toggle/<int:user_id>", methods=["POST"])
+@admin_required
+def admin_toggle(user_id):
+    """Enable or disable an account, which also ends its live sessions."""
+    db = get_db()
+    row, error = _admin_target(db, user_id)
+    if row is None:
+        flash(error, "error")
+        return redirect(url_for("admin"))
+    # Disabling has to log the account out, and bumping session_version is how a
+    # cookie is revoked here; enabling bumps it too, so nothing stale survives.
+    db.execute("UPDATE users SET is_active = 1 - is_active, "
+               "session_version = session_version + 1 WHERE id = ?", (user_id,))
+    db.commit()
+    flash(f"{row['username']} is now "
+          f"{'disabled' if row['is_active'] else 'enabled'}.", "success")
+    return redirect(url_for("admin"))
+
+
+@app.route("/admin/reset_password/<int:user_id>", methods=["POST"])
+@admin_required
+def admin_reset_password(user_id):
+    """Set a new password for someone who forgot theirs, ending their sessions."""
+    db = get_db()
+    row, error = _admin_target(db, user_id)
+    if row is None:
+        flash(error, "error")
+        return redirect(url_for("admin"))
+    password = request.form.get("new_password") or ""
+    error = _password_error(password)
+    if error:
+        flash(error, "error")
+        return redirect(url_for("admin"))
+    # The bump is the important half: without it the person's phone would keep
+    # working with the old cookie after the password they forgot was replaced.
+    db.execute("UPDATE users SET password_hash = ?, session_version = session_version + 1 "
+               "WHERE id = ?", (generate_password_hash(password), user_id))
+    db.commit()
+    flash(f"Password reset for {row['username']}. Tell them in person.", "success")
+    return redirect(url_for("admin"))
+
+
+@app.route("/admin/delete/<int:user_id>", methods=["POST"])
+@admin_required
+def admin_delete(user_id):
+    """Delete an account and every pin it owns."""
+    db = get_db()
+    row, error = _admin_target(db, user_id)
+    if row is None:
+        flash(error, "error")
+        return redirect(url_for("admin"))
+    # destinations has ON DELETE CASCADE, but the pragma is per-connection and
+    # not every connection in this file sets it, so the pins go explicitly.
+    db.execute("DELETE FROM destinations WHERE user_id = ?", (user_id,))
+    db.execute("DELETE FROM login_attempts WHERE key = ?", ("u:" + row["username"].lower(),))
+    db.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    db.commit()
+    flash(f"Account {row['username']} and its pins were deleted.", "success")
+    return redirect(url_for("admin"))
+
+
+@app.route("/admin/reassign/<int:dest_id>", methods=["POST"])
+@admin_required
+def admin_reassign(dest_id):
+    """Hand a pin the admin owns to another account.
+
+    This is how the pins inherited from before accounts existed get distributed;
+    it is deliberately limited to the admin's own list, so no admin route ever
+    needs to read another user's destinations.
+    """
+    db = get_db()
+    username = (request.form.get("to_username") or "").strip()
+    target = db.execute("SELECT id, is_active FROM users WHERE username = ?",
+                        (username,)).fetchone()
+    if target is None or not target["is_active"]:
+        flash("No active account has that username.", "error")
+        return redirect(url_for("admin"))
+    pin = get_owned_destination(db, dest_id)
+    if pin is None:
+        flash("Only pins in your own list can be reassigned.", "error")
+        return redirect(url_for("admin"))
+    db.execute("UPDATE destinations SET user_id = ? WHERE id = ? AND user_id = ?",
+               (target["id"], dest_id, g.user["id"]))
+    db.commit()
+    flash(f"{pin['city']} now belongs to {username}.", "success")
+    return redirect(url_for("admin"))
+
+
+# --------------------------------------------------------------------------- #
+# CSRF
+#
+# One random token per session, echoed by every form and compared on every
+# post. A cross-site request can carry the cookie but not the secret inside the
+# body. Origin/Referer are deliberately not checked as well: SameSite=Lax
+# already withholds the cookie from cross-site form posts, and a header
+# comparison adds edge cases (proxies, referrer policy) without teaching
+# anything this project needs.
+# --------------------------------------------------------------------------- #
+def get_csrf_token():
+    return session.setdefault("_csrf", secrets.token_hex(32))
+
+
+@app.before_request
+def verify_csrf():
+    if request.method not in ("POST", "PUT", "PATCH", "DELETE"):
+        return
+    expected = session.get("_csrf", "")
+    # compare_digest, not `!=`: both sides are secrets and the comparison should
+    # not leak how much of a wrong token matched.
+    if not expected or not secrets.compare_digest(request.form.get("csrf_token", ""),
+                                                  expected):
+        abort(400)
+
+
+@app.errorhandler(400)
+def bad_request(error):
+    """A form whose token did not match, or a hand-written request."""
+    if request.path.startswith("/api/"):
+        return jsonify({"error": "bad request"}), 400
+    return render_template("error.html",
+                           message="That form could not be submitted, probably because "
+                                   "this tab was open before you signed in again."), 400
+
+
+@app.errorhandler(413)
+def too_large(error):
+    """A request body over MAX_CONTENT_LENGTH, refused before it was read."""
+    if request.path.startswith("/api/"):
+        return jsonify({"error": "request too large"}), 413
+    return render_template("error.html",
+                           message="That submission was far too large to be a form."), 413
+
+
+@app.context_processor
+def inject_account_helpers():
+    """Make the signed-in user available to every template."""
+    return {"current_user": getattr(g, "user", None)}
+
+
+# The token has to be a Jinja *global* rather than a context-processor value:
+# templates loaded with {% import %} get the environment's globals but not the
+# rendering context, so _form.html's csrf_field() macro could not see it there.
+app.jinja_env.globals["csrf_token"] = get_csrf_token
 
 
 # --------------------------------------------------------------------------- #
@@ -314,11 +944,27 @@ def _summarize(country):
 NOTES_MAX = 500         # keeps a note to one card-sized block of text
 
 
+def get_owned_destination(db, dest_id):
+    """Fetch a pin only if it belongs to the signed-in user.
+
+    Every read or write of `destinations` that names a specific id goes through
+    this, which is what makes another user's pin indistinguishable from one that
+    was never there — same None, same flash, no row touched. It also carries the
+    "a pin always has an owner" invariant that SQLite cannot state here: an
+    ALTER TABLE cannot add a NOT NULL column without a constant default, and a
+    default of 0 would reference a user that cannot exist.
+    """
+    return db.execute("SELECT * FROM destinations WHERE id = ? AND user_id = ?",
+                      (dest_id, g.user["id"])).fetchone()
+
+
 @app.route("/")
+@login_required
 def index():
-    """Render the map planner with every saved destination."""
+    """Render the map planner with the signed-in user's saved destinations."""
     db = get_db()
-    rows = db.execute("SELECT * FROM destinations ORDER BY created_at DESC").fetchall()
+    rows = db.execute("SELECT * FROM destinations WHERE user_id = ? "
+                      "ORDER BY created_at DESC", (g.user["id"],)).fetchall()
     destinations = [dict(row) for row in rows]
     total = len(destinations)
     visited = sum(1 for d in destinations if d["visited_status"] == "visited")
@@ -333,6 +979,7 @@ def index():
 
 
 @app.route("/add", methods=["POST"])
+@login_required
 def add():
     """Save a new pin (coordinates, place name and notes) to SQLite."""
     city = (request.form.get("city") or "").strip()
@@ -350,8 +997,15 @@ def add():
         flash("Could not read the map coordinates. Click the map to drop a pin.", "error")
         return redirect(url_for("index"))
 
-    # This planner only tracks Philippine destinations.
+    # This planner only tracks Philippine destinations. The name is checked
+    # first because that is what the map looked up, and the coordinates next
+    # because a hand-made request can claim any name it likes. A comparison is
+    # also what rejects NaN and infinity, which float() above accepts happily
+    # and a map could never draw.
     if not _is_philippines(country, country_code):
+        flash("Only destinations in the Philippines can be added.", "error")
+        return redirect(url_for("index"))
+    if not (PH_LAT_MIN <= latitude <= PH_LAT_MAX and PH_LNG_MIN <= longitude <= PH_LNG_MAX):
         flash("Only destinations in the Philippines can be added.", "error")
         return redirect(url_for("index"))
 
@@ -364,9 +1018,9 @@ def add():
     db = get_db()
     db.execute(
         """INSERT INTO destinations
-           (city, country, country_code, latitude, longitude, visited_status, notes)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (city, country, country_code, latitude, longitude, status, notes),
+           (user_id, city, country, country_code, latitude, longitude, visited_status, notes)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (g.user["id"], city, country, country_code, latitude, longitude, status, notes),
     )
     db.commit()
     flash(f"Added {city}, {country} to your bucket list.", "success")
@@ -374,42 +1028,54 @@ def add():
 
 
 @app.route("/notes/<int:dest_id>", methods=["POST"])
+@login_required
 def save_notes(dest_id):
     """Replace the free-text notes on an existing pin."""
     notes = (request.form.get("notes") or "").strip()[:NOTES_MAX]
     db = get_db()
-    row = db.execute("SELECT city FROM destinations WHERE id = ?", (dest_id,)).fetchone()
+    row = get_owned_destination(db, dest_id)
     if row is None:
         flash("That destination no longer exists.", "error")
         return redirect(url_for("index"))
-    db.execute("UPDATE destinations SET notes = ? WHERE id = ?", (notes, dest_id))
+    # Re-filtered by owner in the statement itself, not only by the check above:
+    # an admin could hand this pin to someone else in between the two queries.
+    db.execute("UPDATE destinations SET notes = ? WHERE id = ? AND user_id = ?",
+               (notes, dest_id, g.user["id"]))
     db.commit()
     flash(f"Notes saved for {row['city']}.", "success")
     return redirect(url_for("index"))
 
 
 @app.route("/toggle/<int:dest_id>", methods=["POST"])
+@login_required
 def toggle(dest_id):
     """Flip a destination between 'wishlist' and 'visited'."""
     db = get_db()
-    row = db.execute("SELECT visited_status FROM destinations WHERE id = ?", (dest_id,)).fetchone()
+    row = get_owned_destination(db, dest_id)
     if row is None:
         flash("That destination no longer exists.", "error")
         return redirect(url_for("index"))
     new_status = "visited" if row["visited_status"] == "wishlist" else "wishlist"
     db.execute(
-        "UPDATE destinations SET visited_status = ? WHERE id = ?",
-        (new_status, dest_id),
+        "UPDATE destinations SET visited_status = ? WHERE id = ? AND user_id = ?",
+        (new_status, dest_id, g.user["id"]),
     )
     db.commit()
     return redirect(url_for("index"))
 
 
 @app.route("/delete/<int:dest_id>", methods=["POST"])
+@login_required
 def delete(dest_id):
-    """Remove a destination pin."""
+    """Remove a destination pin, if it is one of ours."""
     db = get_db()
-    db.execute("DELETE FROM destinations WHERE id = ?", (dest_id,))
+    if get_owned_destination(db, dest_id) is None:
+        # Checked first instead of deleting blindly: an id from someone else's
+        # list must not report the success it never had.
+        flash("That destination no longer exists.", "error")
+        return redirect(url_for("index"))
+    db.execute("DELETE FROM destinations WHERE id = ? AND user_id = ?",
+               (dest_id, g.user["id"]))
     db.commit()
     flash("Destination removed.", "success")
     return redirect(url_for("index"))
@@ -419,6 +1085,7 @@ def delete(dest_id):
 # JSON API used by the front-end JavaScript
 # --------------------------------------------------------------------------- #
 @app.route("/api/reverse")
+@login_required
 def api_reverse():
     """Reverse-geocode a lat/lng pair into a city, country and country code.
 
@@ -469,6 +1136,7 @@ def api_reverse():
 
 
 @app.route("/api/country/<code>")
+@login_required
 def api_country(code):
     """Return flag, currency and language data for a 2-letter country code."""
     code = (code or "").strip().lower()
@@ -657,15 +1325,20 @@ def _commons_category_file(category):
     return cached_lookup("photo", f"category:{category}", fetch)
 
 
-def _place_hint(lat, lon):
-    """City a pin belongs to, so photo searches aren't just a bare landmark name."""
+def _place_hint(lat, lon, user_id):
+    """City a pin belongs to, so photo searches aren't just a bare landmark name.
+
+    Scoped to the caller's own pins: /api/landmarks takes any lat/lng, so an
+    unscoped match would let one user's photo results reveal where someone else
+    dropped a pin.
+    """
     try:
         db = sqlite3.connect(DATABASE, timeout=10)
         try:
             row = db.execute(
                 """SELECT city FROM destinations
-                   WHERE ROUND(latitude, 3) = ? AND ROUND(longitude, 3) = ?""",
-                (round(lat, 3), round(lon, 3)),
+                   WHERE user_id = ? AND ROUND(latitude, 3) = ? AND ROUND(longitude, 3) = ?""",
+                (user_id, round(lat, 3), round(lon, 3)),
             ).fetchone()
         finally:
             db.close()
@@ -789,6 +1462,7 @@ def _overpass_payload(query, budget=OVERPASS_BUDGET):
 
 
 @app.route("/api/landmarks")
+@login_required
 def api_landmarks():
     """Return nearby landmarks (attractions, historic sites, nature) for a pin."""
     try:
@@ -833,7 +1507,7 @@ def api_landmarks():
 
 def _landmark_response(items, radius, lat, lon, cached=False, stale=False, age_s=None):
     """Attach photos to the cached landmarks and shape the JSON response."""
-    body = {"items": _landmark_photos(items, _place_hint(lat, lon)),
+    body = {"items": _landmark_photos(items, _place_hint(lat, lon, g.user["id"])),
             "radius_m": radius, "origin": {"lat": lat, "lon": lon}}
     if cached:
         body["cached"] = True

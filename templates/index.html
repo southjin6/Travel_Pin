@@ -1,4 +1,5 @@
 {% extends "layout.html" %}
+{% import "_form.html" as forms %}
 
 {% block title %}Philippine Travel Bucket List &amp; Map Planner{% endblock %}
 
@@ -37,6 +38,7 @@
 
         <!-- Form populated by JavaScript after a map click -->
         <form id="pin-form" class="pin-form hidden" method="post" action="{{ url_for('add') }}">
+            {{ forms.csrf_field() }}
             <h2 class="form-title">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 10c0 7-9 12-9 12s-9-5-9-12a9 9 0 0 1 18 0Z"/><circle cx="12" cy="10" r="3"/></svg>
                 New destination
@@ -110,6 +112,7 @@
                     {% if d.notes %}<p class="notes">{{ d.notes }}</p>{% endif %}
                     <form method="post" action="{{ url_for('save_notes', dest_id=d.id) }}"
                           class="note-form hidden" id="note-form-{{ d.id }}">
+                        {{ forms.csrf_field() }}
                         <textarea name="notes" rows="3" maxlength="{{ notes_max }}"
                                   aria-label="Notes for {{ d.city }}"
                                   placeholder="Itinerary ideas, best time to go...">{{ d.notes }}</textarea>
@@ -120,6 +123,7 @@
                     </form>
                     <div class="card-actions">
                         <form method="post" action="{{ url_for('toggle', dest_id=d.id) }}">
+                            {{ forms.csrf_field() }}
                             <button type="submit" class="btn btn-small btn-toggle">
                                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><path d="m9 11 3 3L22 4"/></svg>
                                 {{ 'Mark wishlist' if d.visited_status == 'visited' else 'Mark visited' }}
@@ -127,6 +131,7 @@
                         </form>
                         <form method="post" action="{{ url_for('delete', dest_id=d.id) }}"
                               onsubmit="return confirm('Remove this destination?');">
+                            {{ forms.csrf_field() }}
                             <button type="submit" class="btn btn-small btn-danger">
                                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/></svg>
                                 Delete

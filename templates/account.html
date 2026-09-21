@@ -1,0 +1,31 @@
+{% extends "layout.html" %}
+{% import "_form.html" as forms %}
+
+{% block title %}Account &middot; Philippine Travel Bucket List{% endblock %}
+
+{% block content %}
+<section class="auth-card">
+    <h2 class="form-title">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"/></svg>
+        Change password
+    </h2>
+    <p class="auth-note">Signed in as <strong>{{ current_user.username }}</strong>{% if current_user.is_admin %} (administrator){% endif %}.
+        Changing it here signs out your other devices; this tab stays signed in.</p>
+    <form method="post" action="{{ url_for('account') }}" class="pin-form">
+        {{ forms.csrf_field() }}
+        <label>Current password
+            <input type="password" name="current_password" autocomplete="current-password" required autofocus>
+        </label>
+        <label>New password
+            <input type="password" name="new_password" autocomplete="new-password" minlength="8" maxlength="200" required>
+        </label>
+        <label>Confirm new password
+            <input type="password" name="confirm" autocomplete="new-password" minlength="8" maxlength="200" required>
+        </label>
+        <div class="form-actions">
+            <button type="submit" class="btn btn-primary">Change password</button>
+            <a class="btn btn-ghost" href="{{ url_for('index') }}">Back to the map</a>
+        </div>
+    </form>
+</section>
+{% endblock %}

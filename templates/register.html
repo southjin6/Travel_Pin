@@ -1,0 +1,35 @@
+{% extends "layout.html" %}
+{% import "_form.html" as forms %}
+
+{% block title %}Create an account &middot; Philippine Travel Bucket List{% endblock %}
+
+{% block content %}
+<section class="auth-card">
+    <h2 class="form-title">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M19 8v6M22 11h-6"/></svg>
+        Create an account
+    </h2>
+    <p class="auth-note">A new account starts with an empty list. Pins, notes and statuses are yours alone.</p>
+    <form method="post" action="{{ url_for('register') }}" class="pin-form">
+        {{ forms.csrf_field() }}
+        <label>Username
+            <input type="text" name="username" autocomplete="username"
+                   pattern="[A-Za-z0-9][A-Za-z0-9._-]{2,19}" required autofocus>
+        </label>
+        <p class="field-hint">3&ndash;20 characters: letters, digits and <code>._-</code>, starting with a letter or digit.</p>
+        <label>Password
+            <input type="password" name="password" autocomplete="new-password"
+                   minlength="8" maxlength="200" required>
+        </label>
+        <p class="field-hint">At least 8 characters. Length matters more than symbols.</p>
+        <label>Confirm password
+            <input type="password" name="confirm" autocomplete="new-password"
+                   minlength="8" maxlength="200" required>
+        </label>
+        <div class="form-actions">
+            <button type="submit" class="btn btn-primary">Create account</button>
+        </div>
+    </form>
+    <p class="auth-note">Already have one? <a href="{{ url_for('login') }}">Sign in</a>.</p>
+</section>
+{% endblock %}

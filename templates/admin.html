@@ -1,0 +1,92 @@
+{% extends "layout.html" %}
+{% import "_form.html" as forms %}
+
+{% block title %}Accounts &middot; Philippine Travel Bucket List{% endblock %}
+
+{% block content %}
+<section class="admin-panel">
+    <h2 class="section-title">Accounts</h2>
+    <p class="auth-note">Administration covers accounts, not itineraries: you cannot see another
+        user&rsquo;s pins from here. Use a password reset when someone forgets theirs &mdash; it signs
+        out every device they are using. Their own <a href="{{ url_for('account') }}">change-password
+        page</a> does the same without you ever seeing the password.</p>
+
+    <table class="admin-table">
+        <thead>
+            <tr>
+                <th scope="col">Username</th>
+                <th scope="col">Role</th>
+                <th scope="col">Status</th>
+                <th scope="col">Pins</th>
+                <th scope="col">Created (UTC)</th>
+                <th scope="col">Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for u in users %}
+            <tr>
+                <td>{{ u.username }}{% if u.id == current_user.id %} <span class="you">you</span>{% endif %}</td>
+                <td>{{ 'administrator' if u.is_admin else 'member' }}</td>
+                <td><span class="badge badge-{{ 'visited' if u.is_active else 'wishlist' }}">
+                    {{ 'active' if u.is_active else 'disabled' }}</span></td>
+                <td>{{ u.pin_count }}</td>
+                <td class="admin-when">{{ u.created_at }}</td>
+                <td>
+                    {% if u.id == current_user.id %}
+                        <span class="auth-note">This is your own account.</span>
+                    {% else %}
+                        <details>
+                            <summary>Manage {{ u.username }}</summary>
+                            <div class="admin-actions">
+                                <form method="post" action="{{ url_for('admin_toggle', user_id=u.id) }}" class="admin-form">
+                                    {{ forms.csrf_field() }}
+                                    <button type="submit" class="btn btn-small btn-ghost">
+                                        {{ 'Disable account' if u.is_active else 'Enable account' }}
+                                    </button>
+                                </form>
+                                <form method="post" action="{{ url_for('admin_reset_password', user_id=u.id) }}" class="admin-form">
+                                    {{ forms.csrf_field() }}
+                                    <label>New password for {{ u.username }}
+                                        <input type="text" name="new_password" minlength="8" maxlength="200"
+                                               autocomplete="off" placeholder="at least 8 characters" required>
+                                    </label>
+                                    <button type="submit" class="btn btn-small btn-primary">Set password</button>
+                                </form>
+                                <form method="post" action="{{ url_for('admin_delete', user_id=u.id) }}" class="admin-form"
+                                      onsubmit="return confirm('Delete {{ u.username }} and their {{ u.pin_count }} pin(s)? This cannot be undone.');">
+                                    {{ forms.csrf_field() }}
+                                    <button type="submit" class="btn btn-small btn-danger">Delete account</button>
+                                </form>
+                            </div>
+                        </details>
+                    {% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</section>
+
+<section class="admin-panel">
+    <h2 class="section-title">Hand over one of your pins</h2>
+    <p class="auth-note">Pins that predate accounts were adopted by this admin list; move each one to
+        the person it belongs to. It leaves your list as soon as it is accepted.</p>
+    {% if my_pins %}
+        <ul class="reassign-list">
+            {% for p in my_pins %}
+            <li>
+                <form method="post" action="{{ url_for('admin_reassign', dest_id=p.id) }}" class="reassign-form">
+                    {{ forms.csrf_field() }}
+                    <span class="reassign-city">{{ p.city }}</span>
+                    <input type="text" name="to_username" placeholder="username to receive it"
+                           autocomplete="off" required>
+                    <button type="submit" class="btn btn-small btn-primary">Reassign</button>
+                </form>
+            </li>
+            {% endfor %}
+        </ul>
+    {% else %}
+        <p class="auth-note">You have no pins to hand over.</p>
+    {% endif %}
+</section>
+{% endblock %}

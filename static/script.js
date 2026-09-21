@@ -6,6 +6,13 @@
 (function () {
     "use strict";
 
+    // Everything below is the map page. layout.html loads this file everywhere,
+    // and on a page with no #map element L.map() throws "Map container not
+    // found", which would abort the whole script.
+    if (!document.getElementById("map")) {
+        return;
+    }
+
     // --- Initialize the interactive Leaflet map (Philippines only) -----------
     // Tight bounding box that hugs the Philippine archipelago.
     var PH_BOUNDS = [[4.0, 117.0], [21.3, 126.7]];
@@ -32,7 +39,7 @@
     var phHole = [[4.0, 117.0], [4.0, 126.7], [21.3, 126.7], [21.3, 117.0]];
     L.polygon([worldRing, phHole], {
         stroke: false,
-        fillColor: "#0b1f3a",
+        fillColor: "#001f5e",
         fillOpacity: 1,
         fillRule: "evenodd",
         interactive: false

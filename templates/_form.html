@@ -1,0 +1,5 @@
+{# One hidden field per form: the value app.py's verify_csrf() compares against
+   the token stored in this browser's session. #}
+{% macro csrf_field() -%}
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+{%- endmacro %}

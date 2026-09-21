@@ -1,3 +1,4 @@
+{% import "_form.html" as forms %}
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -27,6 +28,25 @@
             <span class="eyebrow">&#127477;&#127469; Island-hopping planner</span>
             <h1 class="site-title">Philippine Travel Bucket List</h1>
             <p class="subtitle">Drop a pin anywhere in the Philippines, auto-fill country data, and track your dream itinerary across 7,000 islands.</p>
+
+            {# The only links on the site live here, so they need to read against
+               the header's own gradient rather than the card styles below. #}
+            <nav class="header-nav" aria-label="Account">
+                {% if current_user %}
+                    <span class="nav-user">Signed in as <strong>{{ current_user.username }}</strong></span>
+                    {% if current_user.is_admin %}
+                        <a href="{{ url_for('admin') }}">Admin</a>
+                    {% endif %}
+                    <a href="{{ url_for('account') }}">Change password</a>
+                    <form method="post" action="{{ url_for('logout') }}">
+                        {{ forms.csrf_field() }}
+                        <button type="submit" class="btn-link">Sign out</button>
+                    </form>
+                {% else %}
+                    <a href="{{ url_for('login') }}">Sign in</a>
+                    <a href="{{ url_for('register') }}">Create an account</a>
+                {% endif %}
+            </nav>
         </div>
         <svg class="header-wave" viewBox="0 0 1440 80" preserveAspectRatio="none" aria-hidden="true">
             <path d="M0,40 C240,80 480,0 720,24 C960,48 1200,80 1440,40 L1440,80 L0,80 Z"></path>
