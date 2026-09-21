@@ -291,7 +291,7 @@ main { max-width: 1180px; margin: 0 auto; padding: 1.5rem 1.25rem 2.5rem; }
     color: var(--muted);
     margin-bottom: .85rem;
 }
-.pin-form input, .pin-form select, .pin-form textarea {
+.pin-form input, .pin-form select, .pin-form textarea, .note-form textarea {
     width: 100%;
     margin-top: .35rem;
     padding: .6rem .75rem;
@@ -303,8 +303,9 @@ main { max-width: 1180px; margin: 0 auto; padding: 1.5rem 1.25rem 2.5rem; }
     background: #f8fbfc;
     transition: border-color .15s, box-shadow .15s, background .15s;
 }
-.pin-form textarea { resize: vertical; }
-.pin-form input:focus, .pin-form select:focus, .pin-form textarea:focus {
+.pin-form textarea, .note-form textarea { resize: vertical; }
+.pin-form input:focus, .pin-form select:focus, .pin-form textarea:focus,
+.note-form textarea:focus {
     outline: none;
     background: #fff;
     border-color: var(--teal);
@@ -399,6 +400,12 @@ main { max-width: 1180px; margin: 0 auto; padding: 1.5rem 1.25rem 2.5rem; }
 .card-actions { display: flex; gap: .45rem; flex-wrap: wrap; margin-top: .85rem; }
 .card-actions form { margin: 0; }
 
+/* Inline note editor: hidden until a card's Edit notes button opens it */
+.note-form { margin-top: .7rem; }
+.note-form.hidden { display: none; }
+.note-form textarea { margin-top: 0; }
+.note-actions { display: flex; gap: .45rem; margin-top: .5rem; }
+
 /* ------------------------------------------------------------------ Empty state */
 .empty {
     text-align: center;
@@ -456,17 +463,32 @@ main { max-width: 1180px; margin: 0 auto; padding: 1.5rem 1.25rem 2.5rem; }
 .landmarks-head h3::before { content: "\2605"; color: #7c3aed; }
 #landmarks-place { color: var(--teal); }
 .landmarks-status { font-size: .85rem; color: var(--muted); margin: .5rem 0 .75rem; }
-.landmarks-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: .45rem; max-height: 280px; overflow-y: auto; }
+.landmarks-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: .45rem; max-height: 340px; overflow-y: auto; }
 .landmark-item {
     width: 100%; text-align: left; cursor: pointer;
-    display: flex; flex-direction: column; gap: .12rem;
+    display: flex; align-items: center; gap: .65rem;
     background: #faf6ff; border: 1px solid #ede9fe; border-radius: 11px;
-    padding: .55rem .7rem; font-family: inherit; color: var(--ink);
+    padding: .5rem .65rem; font-family: inherit; color: var(--ink);
     transition: transform .12s ease, box-shadow .12s ease, background .12s ease;
 }
 .landmark-item:hover { transform: translateX(3px); background: #f3e8ff; box-shadow: var(--sh-sm); }
+.landmark-text { display: flex; flex-direction: column; gap: .12rem; min-width: 0; }
 .landmark-name { font-weight: 600; font-size: .92rem; overflow-wrap: anywhere; }
 .landmark-meta { font-size: .76rem; color: #7c3aed; font-weight: 500; }
+.landmark-photo {
+    flex: 0 0 54px; width: 54px; height: 54px;
+    object-fit: cover;
+    border-radius: 9px; border: 1px solid #e4dcfb; background: #f1eafe;
+}
+.landmark-photo-none {
+    display: grid; place-items: center;
+    font-size: 19px; line-height: 1; color: #c4b5fd;
+}
+.popup-photo {
+    display: block; width: 168px; height: 100px; object-fit: cover;
+    margin-bottom: 5px; border-radius: 7px;
+}
+.landmarks-credit { margin: .7rem 0 0; font-size: .72rem; color: var(--muted); }
 
 /* ------------------------------------------------------------------ Scrollbar */
 ::-webkit-scrollbar { width: 11px; height: 11px; }

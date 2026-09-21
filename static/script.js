@@ -9,7 +9,11 @@
     // --- Initialize the interactive Leaflet map (Philippines only) -----------
     // Tight bounding box that hugs the Philippine archipelago.
     var PH_BOUNDS = [[4.0, 117.0], [21.3, 126.7]];
+    // Mercator-centred midpoint of the archipelago (off Bohol Sea / Central Visayas).
+    var PH_CENTER = [12.7, 121.8];
     var map = L.map("map", {
+        center: PH_CENTER,
+        zoom: 6.5,
         maxBounds: PH_BOUNDS,
         maxBoundsViscosity: 1.0,
         minZoom: 5,
@@ -34,8 +38,36 @@
         interactive: false
     }).addTo(map);
 
-    // Frame the whole country on load.
-    map.fitBounds(L.latLngBounds(PH_BOUNDS), { padding: [8, 8] });
+    // Keep the map frame filled with Philippine tiles: find the least zoomed-out
+    // level at which the viewport still fits inside the country box, so neither
+    // the mask beyond its edges nor open sea is ever visible.
+    function countryFillsFrame(zoom) {
+        var sw = map.project(L.latLng(PH_BOUNDS[0][0], PH_BOUNDS[0][1]), zoom);
+        var ne = map.project(L.latLng(PH_BOUNDS[1][0], PH_BOUNDS[1][1]), zoom);
+        var size = map.getSize();
+        return Math.abs(ne.x - sw.x) >= size.x && Math.abs(ne.y - sw.y) >= size.y;
+    }
+
+    function frameFillZoom() {
+        for (var zoom = 3; zoom <= 18; zoom += map.options.zoomSnap) {
+            if (countryFillsFrame(zoom)) return zoom;
+        }
+        return 8;
+    }
+
+    function applyMinZoom() {
+        if (map.getSize().x < 60) return;   // container not laid out yet
+        map.setMinZoom(frameFillZoom());
+    }
+
+    applyMinZoom();
+    map.setView(PH_CENTER, map.getMinZoom());
+
+    var resizeTimer = null;
+    window.addEventListener("resize", function () {
+        clearTimeout(resizeTimer);
+        resizeTimer = setTimeout(applyMinZoom, 200);
+    });
 
     // Different icons for a temporary (in-progress) pin vs. saved destinations.
     var tempIcon = L.divIcon({
@@ -170,27 +202,39 @@
     }
 
     // Pull flag / currency / language data from the REST Countries API
-    // (proxied through our Flask back-end, which holds the API key).
+    // (proxied through our Flask back-end, which holds the API key). Every pin
+    // here is Philippine, so one answer is reused for the whole session.
+    var countryCache = {};
+
+    function describeCountry(c) {
+        if (!c) {
+            lookupStatus.textContent = "Location detected. Add it to your list!";
+            return;
+        }
+        var parts = [];
+        if (c.currencies) parts.push(c.currencies);
+        if (c.languages) parts.push(c.languages.split(", ").slice(0, 3).join(", "));
+        lookupStatus.innerHTML =
+            '<span class="lookup-flag">' + escapeHtml(c.flag_emoji || "") + "</span> " +
+            escapeHtml(c.name || "") +
+            (parts.length ? " &middot; " + escapeHtml(parts.join(" · ")) : "");
+    }
+
     function fetchCountry(code) {
         if (!code) {
-            lookupStatus.textContent = "Location detected. Add it to your list!";
+            describeCountry(null);
+            return Promise.resolve();
+        }
+        if (countryCache[code]) {
+            describeCountry(countryCache[code]);
             return Promise.resolve();
         }
         return fetch("/api/country/" + encodeURIComponent(code))
             .then(function (r) { return r.ok ? r.json() : null; })
             .then(function (c) {
-                if (!c || c.error) {
-                    lookupStatus.textContent = "Location detected. Add it to your list!";
-                    return;
-                }
-                var flag = c.flag_emoji || "";
-                var parts = [];
-                if (c.currencies) parts.push(c.currencies);
-                if (c.languages) parts.push(c.languages.split(", ").slice(0, 3).join(", "));
-                lookupStatus.innerHTML =
-                    '<span class="lookup-flag">' + flag + "</span> " +
-                    escapeHtml(c.name || "") +
-                    (parts.length ? " &middot; " + escapeHtml(parts.join(" · ")) : "");
+                if (!c || c.error) return;
+                countryCache[code] = c;
+                describeCountry(c);
             })
             .catch(function () { /* non-fatal */ });
     }
@@ -217,6 +261,29 @@
         });
     });
 
+    // --- "Add / Edit notes" opens that card's inline editor ------------------
+    // Saving is a plain form POST, so the editor works without JavaScript; the
+    // buttons only decide which single card is open at a time.
+    document.querySelectorAll(".edit-note").forEach(function (btn) {
+        btn.addEventListener("click", function () {
+            var form = document.getElementById(btn.getAttribute("data-target"));
+            if (!form) return;
+            var wasOpen = !form.classList.contains("hidden");
+            document.querySelectorAll(".note-form").forEach(function (f) {
+                f.classList.add("hidden");
+            });
+            if (wasOpen) return;
+            form.classList.remove("hidden");
+            form.querySelector("textarea").focus();
+        });
+    });
+
+    document.querySelectorAll(".cancel-note").forEach(function (btn) {
+        btn.addEventListener("click", function () {
+            btn.closest(".note-form").classList.add("hidden");
+        });
+    });
+
     // --- Nearby landmarks (Overpass / OpenStreetMap) -------------------------
     var landmarkLayer = L.layerGroup().addTo(map);
     var landmarkIcon = L.divIcon({
@@ -232,6 +299,7 @@
     var lmPlace = document.getElementById("landmarks-place");
     var lmClose = document.getElementById("landmarks-close");
     var activeLandmarkBtn = null;
+    var activeLandmarkName = null;
 
     function clearLandmarks() {
         landmarkLayer.clearLayers();
@@ -239,72 +307,140 @@
         if (lmPanel) lmPanel.classList.add("hidden");
         if (activeLandmarkBtn) activeLandmarkBtn.classList.remove("is-active");
         activeLandmarkBtn = null;
+        activeLandmarkName = null;
+    }
+
+    // A landmark scan is the priciest request this app makes, so each pin's
+    // results are kept for the session and re-opened without the network.
+    var landmarkCache = {};
+    var landmarksPending = false;
+
+    function renderLandmarks(lat, lon, data) {
+        var items = data.items || [];
+        if (!items.length) {
+            lmStatus.textContent = "No landmarks found nearby — try a more central spot.";
+            return;
+        }
+        lmStatus.textContent = "Showing " + items.length + " landmark" +
+            (items.length > 1 ? "s" : "") + " within ~" +
+            Math.round((data.radius_m || 15000) / 1000) + " km." +
+            (data.stale ? " (cached copy — service is busy)" : "");
+
+        var pts = [[lat, lon]];
+        items.forEach(function (it) {
+            var marker = L.marker([it.lat, it.lon], { icon: landmarkIcon });
+            marker.bindPopup(
+                (it.image
+                    ? '<img class="popup-photo" src="' + escapeHtml(it.image) +
+                      '" alt="' + escapeHtml(it.name) + '"><br>'
+                    : "") +
+                "<strong>" + escapeHtml(it.name) + "</strong><br>" +
+                '<span class="popup-type">' + escapeHtml(it.type) + "</span> &middot; " +
+                it.distance_km + " km"
+            );
+            marker.addTo(landmarkLayer);
+            pts.push([it.lat, it.lon]);
+
+            var li = document.createElement("li");
+            var item = document.createElement("button");
+            item.type = "button";
+            item.className = "landmark-item";
+            item.addEventListener("click", function () {
+                map.setView([it.lat, it.lon], 13, { animate: true });
+                marker.openPopup();
+            });
+
+            // Thumbnail when Wikimedia has one, otherwise a neutral frame.
+            var photo = document.createElement(it.image ? "img" : "span");
+            photo.className = it.image ? "landmark-photo" : "landmark-photo landmark-photo-none";
+            photo.setAttribute("aria-hidden", "true");
+            if (it.image) {
+                photo.src = it.image;
+                photo.alt = it.name;
+                // Deliberately not loading="lazy": most rows sit below the fold
+                // in the scrolling panel, and lazy images there are never
+                // fetched, so the list looks like it has no pictures at all.
+                photo.addEventListener("error", function () {
+                    var frame = document.createElement("span");
+                    frame.className = "landmark-photo landmark-photo-none";
+                    frame.setAttribute("aria-hidden", "true");
+                    frame.textContent = "\uD83D\uDCF7";
+                    if (photo.parentNode) photo.parentNode.replaceChild(frame, photo);
+                });
+            } else {
+                photo.textContent = "\uD83D\uDCF7";
+            }
+
+            var nm = document.createElement("span");
+            nm.className = "landmark-name";
+            nm.textContent = it.name;
+            var meta = document.createElement("span");
+            meta.className = "landmark-meta";
+            meta.textContent = it.type + " · " + it.distance_km + " km";
+            var text = document.createElement("span");
+            text.className = "landmark-text";
+            text.appendChild(nm);
+            text.appendChild(meta);
+            item.appendChild(photo);
+            item.appendChild(text);
+            li.appendChild(item);
+            lmList.appendChild(li);
+        });
+        map.fitBounds(L.latLngBounds(pts), { padding: [40, 40], maxZoom: 13 });
+        lmPanel.scrollIntoView({ behavior: "smooth", block: "nearest" });
     }
 
     function showLandmarks(btn) {
         if (activeLandmarkBtn === btn) { clearLandmarks(); return; }
-        clearLandmarks();
-
         var lat = parseFloat(btn.getAttribute("data-lat"));
         var lon = parseFloat(btn.getAttribute("data-lon"));
-        var name = btn.getAttribute("data-name") || "here";
+        var key = lat.toFixed(3) + "," + lon.toFixed(3);
+
+        // A cold scan takes tens of seconds; say so instead of eating the click.
+        if (landmarksPending) {
+            if (lmPanel.classList.contains("hidden")) {
+                lmPanel.classList.remove("hidden");
+                lmPlace.textContent = btn.getAttribute("data-name") || "here";
+            }
+            lmStatus.textContent = "Still scanning " + (activeLandmarkName || "the previous pin") +
+                " — one moment.";
+            return;
+        }
+        clearLandmarks();
 
         activeLandmarkBtn = btn;
+        activeLandmarkName = btn.getAttribute("data-name") || "here";
         btn.classList.add("is-active");
         lmPanel.classList.remove("hidden");
-        lmPlace.textContent = name;
-        lmStatus.textContent = "Scanning OpenStreetMap for nearby landmarks…";
+        lmPlace.textContent = activeLandmarkName;
 
+        if (landmarkCache[key]) {
+            renderLandmarks(lat, lon, landmarkCache[key]);
+            return;
+        }
+
+        lmStatus.textContent = "Scanning OpenStreetMap for nearby landmarks" +
+            " (a first look takes up to half a minute)…";
+        landmarksPending = true;
         fetch("/api/landmarks?lat=" + lat + "&lon=" + lon)
             .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
             .then(function (res) {
                 var data = res.d || {};
-                var items = data.items || [];
-                if (!res.ok && data.error) { lmStatus.textContent = data.error; return; }
-                if (!items.length) {
-                    lmStatus.textContent = "No landmarks found nearby — try a more central spot.";
+                if (!res.ok) {
+                    lmStatus.textContent = data.error || "Could not load landmarks right now.";
+                    if (data.retry_after_s) {
+                        lmStatus.textContent += " Next try in ~" +
+                            Math.ceil(data.retry_after_s / 60) + " min.";
+                    }
                     return;
                 }
-                lmStatus.textContent = "Showing " + items.length + " landmark" +
-                    (items.length > 1 ? "s" : "") + " within ~" +
-                    Math.round((data.radius_m || 15000) / 1000) + " km.";
-
-                var pts = [[lat, lon]];
-                items.forEach(function (it) {
-                    var marker = L.marker([it.lat, it.lon], { icon: landmarkIcon });
-                    marker.bindPopup(
-                        "<strong>" + escapeHtml(it.name) + "</strong><br>" +
-                        '<span class="popup-type">' + escapeHtml(it.type) + "</span> &middot; " +
-                        it.distance_km + " km"
-                    );
-                    marker.addTo(landmarkLayer);
-                    pts.push([it.lat, it.lon]);
-
-                    var li = document.createElement("li");
-                    var item = document.createElement("button");
-                    item.type = "button";
-                    item.className = "landmark-item";
-                    item.addEventListener("click", function () {
-                        map.setView([it.lat, it.lon], 13, { animate: true });
-                        marker.openPopup();
-                    });
-                    var nm = document.createElement("span");
-                    nm.className = "landmark-name";
-                    nm.textContent = it.name;
-                    var meta = document.createElement("span");
-                    meta.className = "landmark-meta";
-                    meta.textContent = it.type + " · " + it.distance_km + " km";
-                    item.appendChild(nm);
-                    item.appendChild(meta);
-                    li.appendChild(item);
-                    lmList.appendChild(li);
-                });
-                map.fitBounds(L.latLngBounds(pts), { padding: [40, 40], maxZoom: 13 });
-                lmPanel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+                if (data.items && data.items.length) landmarkCache[key] = data;
+                renderLandmarks(lat, lon, data);
             })
             .catch(function () {
                 lmStatus.textContent = "Could not load landmarks right now.";
-            });
+            })
+            .then(function () { landmarksPending = false; });
     }
 
     document.querySelectorAll(".btn-landmark").forEach(function (btn) {
