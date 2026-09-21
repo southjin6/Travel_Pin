@@ -1,0 +1,149 @@
+{% extends "layout.html" %}
+
+{% block title %}Philippine Travel Bucket List &amp; Map Planner{% endblock %}
+
+{% block content %}
+<section class="stats">
+    <div class="stat stat-total">
+        <span class="stat-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 10c0 7-9 12-9 12s-9-5-9-12a9 9 0 0 1 18 0Z"/><circle cx="12" cy="10" r="3"/></svg>
+        </span>
+        <span class="stat-body"><span class="stat-num">{{ total }}</span><span class="stat-label">Total pins</span></span>
+    </div>
+    <div class="stat stat-wishlist">
+        <span class="stat-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.6l-1-1a5.5 5.5 0 0 0-7.8 7.8l1 1L12 21l7.8-7.6 1-1a5.5 5.5 0 0 0 0-7.8Z"/></svg>
+        </span>
+        <span class="stat-body"><span class="stat-num">{{ wishlist }}</span><span class="stat-label">On wishlist</span></span>
+    </div>
+    <div class="stat stat-visited">
+        <span class="stat-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><path d="m9 11 3 3L22 4"/></svg>
+        </span>
+        <span class="stat-body"><span class="stat-num">{{ visited }}</span><span class="stat-label">Visited</span></span>
+    </div>
+</section>
+
+<div class="planner">
+    <!-- Interactive Leaflet map -->
+    <div class="map-column">
+        <div class="map-card">
+            <div id="map" aria-label="Interactive travel map"></div>
+        </div>
+        <p class="hint">
+            <span class="hint-dot" aria-hidden="true"></span>
+            Tip: click anywhere in the Philippines to drop a pin. Only Philippine destinations can be saved.
+        </p>
+
+        <!-- Form populated by JavaScript after a map click -->
+        <form id="pin-form" class="pin-form hidden" method="post" action="{{ url_for('add') }}">
+            <h2 class="form-title">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 10c0 7-9 12-9 12s-9-5-9-12a9 9 0 0 1 18 0Z"/><circle cx="12" cy="10" r="3"/></svg>
+                New destination
+            </h2>
+            <label>City / place
+                <input type="text" name="city" id="f-city" placeholder="e.g. Vigan" autocomplete="off">
+            </label>
+            <label>Country
+                <input type="text" name="country" id="f-country" placeholder="Philippines" autocomplete="off">
+            </label>
+            <input type="hidden" name="country_code" id="f-country-code">
+            <input type="hidden" name="latitude" id="f-lat">
+            <input type="hidden" name="longitude" id="f-lon">
+            <label>Status
+                <select name="visited_status" id="f-status">
+                    <option value="wishlist">Wishlist (want to visit)</option>
+                    <option value="visited">Visited</option>
+                </select>
+            </label>
+            <label>Notes
+                <textarea name="notes" id="f-notes" rows="3" placeholder="Itinerary ideas, best time to go..."></textarea>
+            </label>
+            <div class="form-actions">
+                <button type="submit" class="btn btn-primary">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z"/><path d="M17 21v-8H7v8M7 3v5h8"/></svg>
+                    Save pin
+                </button>
+                <button type="button" id="cancel-pin" class="btn btn-ghost">Cancel</button>
+            </div>
+            <p id="lookup-status" class="lookup-status"></p>
+        </form>
+
+        <!-- Landmarks panel populated by JavaScript on demand -->
+        <div id="landmarks-panel" class="landmarks-panel hidden">
+            <div class="landmarks-head">
+                <h3>Landmarks near <span id="landmarks-place"></span></h3>
+                <button type="button" id="landmarks-close" class="btn btn-small btn-ghost">Hide</button>
+            </div>
+            <p id="landmarks-status" class="landmarks-status"></p>
+            <ul id="landmarks-list" class="landmarks-list"></ul>
+        </div>
+    </div>
+
+    <!-- Destination summary cards -->
+    <div class="cards-column">
+        <h2 class="section-title">Your destinations</h2>
+        {% if destinations %}
+            <ul class="card-list">
+                {% for d in destinations %}
+                <li class="card {{ 'card-visited' if d.visited_status == 'visited' else 'card-wishlist' }}">
+                    <div class="card-top">
+                        {% if d.country_code %}
+                        <img class="flag" src="https://flagcdn.com/w80/{{ d.country_code }}.png"
+                             alt="Flag of {{ d.country }}" width="40" height="30" loading="lazy">
+                        {% else %}
+                        <span class="flag flag-placeholder" aria-hidden="true">&#127988;</span>
+                        {% endif %}
+                        <div class="card-heading">
+                            <h3>{{ d.city }}</h3>
+                            <p class="card-country">{{ d.country }}</p>
+                        </div>
+                        <span class="badge badge-{{ d.visited_status }}">
+                            {{ 'Visited' if d.visited_status == 'visited' else 'Wishlist' }}
+                        </span>
+                    </div>
+                    <p class="coords">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10Z"/></svg>
+                        {{ '%.4f'|format(d.latitude) }}, {{ '%.4f'|format(d.longitude) }}
+                    </p>
+                    {% if d.notes %}<p class="notes">{{ d.notes }}</p>{% endif %}
+                    <div class="card-actions">
+                        <form method="post" action="{{ url_for('toggle', dest_id=d.id) }}">
+                            <button type="submit" class="btn btn-small btn-toggle">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><path d="m9 11 3 3L22 4"/></svg>
+                                {{ 'Mark wishlist' if d.visited_status == 'visited' else 'Mark visited' }}
+                            </button>
+                        </form>
+                        <form method="post" action="{{ url_for('delete', dest_id=d.id) }}"
+                              onsubmit="return confirm('Remove this destination?');">
+                            <button type="submit" class="btn btn-small btn-danger">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/></svg>
+                                Delete
+                            </button>
+                        </form>
+                        <button type="button" class="btn btn-small btn-ghost focus-pin"
+                                data-lat="{{ d.latitude }}" data-lon="{{ d.longitude }}">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg>
+                            Focus
+                        </button>
+                        <button type="button" class="btn btn-small btn-landmark"
+                                data-id="{{ d.id }}" data-lat="{{ d.latitude }}" data-lon="{{ d.longitude }}" data-name="{{ d.city }}">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m3 20 5-9 4 6 3-4 6 7z"/><circle cx="6" cy="5" r="2"/></svg>
+                            Landmarks
+                        </button>
+                    </div>
+                </li>
+                {% endfor %}
+            </ul>
+        {% else %}
+            <div class="empty">
+                <span class="empty-emoji" aria-hidden="true">&#128506;&#65039;</span>
+                <p>No destinations yet. Click the map to drop your first Philippine pin!</p>
+            </div>
+        {% endif %}
+    </div>
+</div>
+
+<!-- Existing destinations handed to the front-end script for marker rendering -->
+<script id="destinations-data" type="application/json">{{ destinations | tojson }}</script>
+{% endblock %}
