@@ -82,6 +82,15 @@ SCHEMA = os.path.join(BASE_DIR, "schema.sql")
 # database one version closer to it; never edit an old step, add a new one.
 SCHEMA_VERSION = 2
 
+# How old an api_cache row must be before startup deletes it. The floor of 31 is
+# deliberate: the longest entry in CACHE_TTL lives 30 days, and pruning anything
+# younger than that would throw away answers the app would still consider fresh
+# and re-fetch them. 90 days leaves margin while still bounding growth.
+try:
+    CACHE_RETENTION_DAYS = max(31, int(os.environ.get("CACHE_RETENTION_DAYS") or 90))
+except ValueError:
+    CACHE_RETENTION_DAYS = 90
+
 # REST Countries v5 (the legacy v3.1 endpoint has been deprecated). Live data
 # requires a personal API key from https://restcountries.com/sign-up; set it via
 # the RESTCOUNTRIES_API_KEY environment variable. The public demo key below only
@@ -122,9 +131,13 @@ def _is_philippines(country, code):
 def get_db():
     """Return a per-request SQLite connection stored on Flask's `g` object."""
     if "db" not in g:
-        g.db = sqlite3.connect(DATABASE)
+        # timeout=10 raises SQLite's busy timeout from its 5s default: with more
+        # than one gunicorn worker a writer can hold the lock while this request
+        # waits, and giving up after 5s would surface to the user as a 500.
+        g.db = sqlite3.connect(DATABASE, timeout=10)
         g.db.row_factory = sqlite3.Row
         g.db.execute("PRAGMA foreign_keys = ON")
+        g.db.execute("PRAGMA busy_timeout = 10000")
     return g.db
 
 
@@ -147,12 +160,18 @@ def init_db():
         # Set before the schema runs: this connection is one of several that do
         # not go through get_db(), and CASCADE only fires where the pragma is on.
         db.execute("PRAGMA foreign_keys = ON")
+        # WAL belongs to the database file rather than the connection, so this
+        # only has to happen once. It is what stops a reader from blocking on a
+        # writer: in the default rollback-journal mode two gunicorn workers
+        # writing at the same moment take turns by failing, not by waiting.
+        db.execute("PRAGMA journal_mode = WAL")
         with open(SCHEMA, "r", encoding="utf-8") as f:
             db.executescript(f.read())
         _upgrade_schema(db)
         # Focus: remove any destination that is not in the Philippines.
         db.execute("DELETE FROM destinations WHERE LOWER(country_code) != ?", (PH_COUNTRY_CODE,))
         db.execute("CREATE INDEX IF NOT EXISTS idx_destinations_user ON destinations(user_id)")
+        _prune_cache(db)
         db.commit()
     finally:
         db.close()
@@ -181,6 +200,22 @@ def _upgrade_schema(db):
             f"database is at schema_version {version} but this code needs "
             f"{SCHEMA_VERSION}; add a migration step rather than editing an old one."
         )
+
+
+def _prune_cache(db):
+    """Delete cache rows that no TTL could still consider fresh.
+
+    api_cache only ever grows: entries are replaced by key and never expired out,
+    so without this the file keeps every upstream answer the app has ever
+    fetched. This runs once per start rather than on every write, which keeps the
+    read path (a single SELECT before each upstream call) free of a DELETE.
+    """
+    cutoff = time.time() - CACHE_RETENTION_DAYS * 86400
+    removed = db.execute("DELETE FROM api_cache WHERE fetched_at < ?", (cutoff,)).rowcount
+    if removed:
+        # One line in the container log, and only when there was something to remove.
+        print(f"api_cache: pruned {removed} row(s) older than {CACHE_RETENTION_DAYS} days")
+    return removed
 
 
 def _meta_get(db, key):

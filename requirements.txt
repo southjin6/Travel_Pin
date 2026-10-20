@@ -1,2 +1,17 @@
-Flask>=3.0
-requests>=2.31
+# Direct dependencies, pinned to the exact versions this image was verified with.
+Flask==3.1.3
+requests==2.34.2
+gunicorn==26.2.0
+
+# Transitive dependencies, pinned so a rebuild resolves the same set instead of
+# whatever happens to be newest that day. Bump these alongside the three above.
+blinker==1.9.0
+certifi==2026.10.18
+charset-normalizer==3.5.2
+click==8.5.0
+idna==3.20
+itsdangerous==2.2.0
+Jinja2==3.1.6
+MarkupSafe==3.0.4
+urllib3==2.8.0
+Werkzeug==3.1.9
