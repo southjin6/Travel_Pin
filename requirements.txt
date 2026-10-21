@@ -6,7 +6,7 @@ gunicorn==26.2.0
 # Transitive dependencies, pinned so a rebuild resolves the same set instead of
 # whatever happens to be newest that day. Bump these alongside the three above.
 blinker==1.9.0
-certifi==2026.10.18
+certifi==2026.10.19
 charset-normalizer==3.5.2
 click==8.5.0
 idna==3.20
