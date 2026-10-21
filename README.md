@@ -69,9 +69,15 @@ standard library, because that is what `requirements.txt` can install.
   would otherwise be locked out by one person's typos. The counters live in a
   `login_attempts` table, so a restart — or the debug reloader, which wipes
   every in-memory structure in this file — does not unlock anything.
-- **Failed sign-ins are deliberately indistinguishable.** Unknown username,
-  wrong password and disabled account all take one code path and one message, so
-  the form cannot be used to list which usernames exist.
+- **Failed sign-ins all take one message.** Unknown username, wrong password
+  and disabled account share one code path and one message. Their *timing* still
+  differs, because a name with no account never reaches the hasher — deliberately:
+  hashing a nonexistent account would let the login form burn server CPU, and the
+  sign-up form already answers "is this name taken?" for anyone who asks.
+- **Response headers** carry `X-Frame-Options: DENY`, `X-Content-Type-Options:
+  nosniff`, a same-origin referrer policy and a restrictive permissions policy;
+  signed-in pages are `Cache-Control: no-store` so pins and notes do not linger
+  in a shared browser's history. There is no Content-Security-Policy yet.
 - **Ownership is enforced in one place**: `get_owned_destination()` is the only
   function that reads a single pin by id, and it filters on `user_id`. That is
   also why admins get no pin-level access — the one exception in the filter is

@@ -1,24 +1,56 @@
-### Building and running your application
+# Running this with Docker
 
-When you're ready, start your application by running:
-`docker compose up --build`.
+### 1. Create the environment file
 
-Your application will be available at http://localhost:8000.
+```bash
+cp .env.example .env
+```
 
-### Deploying your application to the cloud
+Fill in two values:
 
-First, build your image, e.g.: `docker build -t myapp .`.
-If your cloud uses a different CPU architecture than your development
-machine (e.g., you are on a Mac M1 and your cloud provider is amd64),
-you'll want to build the image for that platform, e.g.:
-`docker build --platform=linux/amd64 -t myapp .`.
+- **`SECRET_KEY`** — required on every start. Generate one with
+  `python -c "import secrets; print(secrets.token_hex(32))"`. Without it the
+  container exits rather than sign cookies with a guessable default.
+- **`ADMIN_PASSWORD`** — required on the **first** start only, to create the
+  recovery account. Once that row exists the variable is never read again, so
+  it can be emptied afterwards.
 
-Then, push it to your registry, e.g. `docker push myregistry.com/myapp`.
+A fresh volume with either value missing does not start quietly: the container
+exits and `restart: unless-stopped` retries it, which looks like a crash loop.
+`docker compose logs server` prints the reason.
 
-Consult Docker's [getting started](https://docs.docker.com/go/get-started-sharing/)
-docs for more detail on building and pushing.
+### 2. Start it
 
-### Keeping the image patched
+```bash
+docker compose up --build
+```
+
+The app is on http://localhost:8000. The `cloudflared` service also publishes it
+at a random `https://<something>.trycloudflare.com` hostname:
+
+```bash
+docker compose logs cloudflared | Select-String trycloudflare
+```
+
+That hostname changes on every start, and anyone holding it can register an
+account — treat it as public.
+
+### 3. Where the data lives
+
+Accounts, pins, lockout state and the API cache are all in the `travel-data`
+volume (full name `travel_pin_travel-data`), mounted at `/data`. It survives
+rebuilds and `docker compose down`.
+
+It does **not** survive `docker compose down -v`, which deletes the volume. To
+take a copy, stop the app first so SQLite checkpoints its write-ahead log:
+
+```powershell
+docker compose stop server
+docker compose cp server:/data/travel.db .\travel-backup.db
+docker compose start server
+```
+
+### 4. Keeping the image patched
 
 The base image (`python:3.14.8-slim`) is rebuilt by its maintainers whenever
 Debian publishes security updates, but the image you built last month keeps
@@ -31,8 +63,7 @@ docker compose up -d
 ```
 
 `--pull` is the part that matters: without it Docker reuses the base image
-already on disk. Accounts and pins live in the `travel-data` volume, so a
-rebuild does not touch them and needs no migration.
+already on disk. The volume is untouched, so there is no migration.
 
 Check what actually landed, rather than assuming:
 
@@ -48,5 +79,22 @@ A rebuild reinstalls exactly what `requirements.txt` pins, so an outdated pin
 stays outdated until it is edited. Bumping a pin and rebuilding is one step, not
 two.
 
+### 5. When something is wrong
+
+| Symptom | Cause |
+| --- | --- |
+| Container restarts every few seconds | Missing `SECRET_KEY`, or a fresh volume with no `ADMIN_PASSWORD`. Read `docker compose logs server`. |
+| `Bind for 127.0.0.1:8000 failed` | Something else holds port 8000; change the left-hand side of the `ports` entry. |
+| Login "works" but every page bounces to sign in | `SESSION_COOKIE_SECURE` is on while you browse over plain `http://localhost`. Unset it for local use; set it to `1` only behind HTTPS. |
+| Tunnel URL 502s | The server is not healthy yet; `docker compose ps` shows the health state, and `cloudflared` waits for it. |
+
+### Deploying to a registry
+
+```bash
+docker build --platform=linux/amd64 -t myregistry.com/myapp .
+docker push myregistry.com/myapp
+```
+
 ### References
+
 * [Docker's Python guide](https://docs.docker.com/language/python/)
