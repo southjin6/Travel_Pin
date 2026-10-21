@@ -66,7 +66,13 @@ app.config["SECRET_KEY"] = SECRET_KEY
 # other sites' top-level posts; HTTPS-only is opt-in because local dev is plain http.
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
-app.config["SESSION_COOKIE_SECURE"] = bool(os.environ.get("SESSION_COOKIE_SECURE"))
+# Parsed, not truthy-tested: bool("0") is True, so a deployment that set
+# SESSION_COOKIE_SECURE=0 to turn the flag off would have turned it on and
+# broken sign-in over plain http. Only an explicit yes switches it on.
+app.config["SESSION_COOKIE_SECURE"] = (
+    (os.environ.get("SESSION_COOKIE_SECURE") or "").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
 # Only applies to a session marked `permanent` (the "remember me" checkbox).
 app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=30)
 # Every form in this app is a few hundred characters of text, so Werkzeug's own
@@ -82,7 +88,7 @@ SCHEMA = os.path.join(BASE_DIR, "schema.sql")
 # database one version closer to it; never edit an old step, add a new one.
 SCHEMA_VERSION = 2
 
-# How old an api_cache row must be before startup deletes it. The floor of 31 is
+# How old an api_cache row must be before it is deleted. The floor of 31 is
 # deliberate: the longest entry in CACHE_TTL lives 30 days, and pruning anything
 # younger than that would throw away answers the app would still consider fresh
 # and re-fetch them. 90 days leaves margin while still bounding growth.
@@ -790,6 +796,27 @@ def too_large(error):
                            message="That submission was far too large to be a form."), 413
 
 
+@app.after_request
+def add_security_headers(response):
+    """Headers Flask does not add, on a page anyone on the internet can reach.
+
+    Clickjacking is the one with teeth here: every destructive action is a
+    form, so a framed copy of the admin page could walk a signed-in admin into
+    one. SameSite=Lax already withholds the cookie from a cross-site frame,
+    which makes this the second lock on that door rather than the only one.
+    """
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "same-origin")
+    response.headers.setdefault(
+        "Permissions-Policy", "geolocation=(), camera=(), microphone=()")
+    if getattr(g, "user", None):
+        # Pins, notes and the CSRF token should not outlive the tab in a shared
+        # browser's history cache.
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 @app.context_processor
 def inject_account_helpers():
     """Make the signed-in user available to every template."""
@@ -843,8 +870,17 @@ def _cache_row(kind, key):
     return payload, time.time() - row[2], bool(row[1])
 
 
+# init_db() prunes api_cache, but that runs once at container start: a
+# deployment that restarts rarely would never prune again and the file would
+# keep every answer it ever fetched. This stamps the last prune so the write
+# path can repeat it daily without putting a DELETE on the read path.
+PRUNE_INTERVAL_S = 24 * 3600
+_last_prune = time.time()
+
+
 def _cache_write(kind, key, payload):
     """Remember an upstream answer; None stores a miss so we back off briefly."""
+    global _last_prune
     try:
         db = sqlite3.connect(DATABASE, timeout=10)
         try:
@@ -854,6 +890,11 @@ def _cache_write(kind, key, payload):
                 (kind, key, json.dumps(payload), int(payload is None), time.time()),
             )
             db.commit()
+            now = time.time()
+            if now - _last_prune >= PRUNE_INTERVAL_S:
+                _last_prune = now
+                _prune_cache(db)
+                db.commit()
         finally:
             db.close()
     except sqlite3.Error:
