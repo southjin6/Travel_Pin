@@ -61,10 +61,14 @@ standard library, because that is what `requirements.txt` can install.
   `secrets.compare_digest` on every `POST`/`PUT`/`PATCH`/`DELETE`. Forms without
   the field get a `400`. `SameSite=Lax` already withholds the cookie on
   cross-site form posts; the token is the in-band check on top of that.
-- **Login is throttled** per username *and* per IP (5 failures in 15 minutes →
-  15-minute lockout), and registration per IP (10 in an hour). The counters live
-  in a `login_attempts` table, so a restart — or the debug reloader, which
-  wipes every in-memory structure in this file — does not unlock anything.
+- **Login is throttled** per username (5 failures in 15 minutes → 15-minute
+  lockout) and per source address (40 failures in 15 minutes → 15-minute pause),
+  with registration per address (10 in an hour). The two login limits differ on
+  purpose: the username rule protects one account, while a whole office — or
+  everyone behind the Docker tunnel, who currently share a single address —
+  would otherwise be locked out by one person's typos. The counters live in a
+  `login_attempts` table, so a restart — or the debug reloader, which wipes
+  every in-memory structure in this file — does not unlock anything.
 - **Failed sign-ins are deliberately indistinguishable.** Unknown username,
   wrong password and disabled account all take one code path and one message, so
   the form cannot be used to list which usernames exist.

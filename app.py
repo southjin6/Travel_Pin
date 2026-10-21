@@ -346,6 +346,12 @@ def _migrate_to_v2(db):
 PASSWORD_MIN, PASSWORD_MAX = 8, 200
 USERNAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{2,19}\Z")
 LOGIN_WINDOW_S, LOGIN_MAX_FAILS, LOGIN_LOCKOUT_S = 15 * 60, 5, 15 * 60
+# The per-address rule is flood control, not a lockout. Everyone behind a
+# reverse proxy or an office NAT shares one address, so a threshold tuned for
+# one person would let any of them stop the whole site from signing in. It caps
+# failed attempts per source (and the login_attempts rows each one writes);
+# protecting a single account is LOGIN_MAX_FAILS's job, and that stays at 5.
+LOGIN_IP_MAX_FAILS = 40
 REGISTER_WINDOW_S, REGISTER_MAX, REGISTER_LOCKOUT_S = 60 * 60, 10, 60 * 60
 FLASH_GENERIC_LOGIN_ERROR = "Invalid username or password."
 
@@ -473,7 +479,13 @@ def login():
     username = (request.form.get("username") or "").strip()
     password = request.form.get("password") or ""
     db = get_db()
-    user_key, ip_key = "u:" + username.lower(), "i:" + (request.remote_addr or "?")
+    # The username is attacker-controlled and becomes a database key, so it is
+    # capped before that happens: no real account can exceed USERNAME_RE's 20
+    # characters, and an uncapped 60 KB one would park 60 KB in login_attempts
+    # on every attempt -- which is exactly what a flood of them would fill the
+    # volume with.
+    user_key = "u:" + username[:64].lower()
+    ip_key = "i:" + (request.remote_addr or "?")
     remaining = max(_lockout_remaining(db, user_key), _lockout_remaining(db, ip_key))
     if remaining:
         flash(f"Too many failed attempts. Try again in {remaining} seconds.", "error")
@@ -490,7 +502,7 @@ def login():
             or not check_password_hash(row["password_hash"], password)
             or not row["is_active"]):
         _note_failure(db, user_key, LOGIN_MAX_FAILS, LOGIN_WINDOW_S, LOGIN_LOCKOUT_S)
-        _note_failure(db, ip_key, LOGIN_MAX_FAILS, LOGIN_WINDOW_S, LOGIN_LOCKOUT_S)
+        _note_failure(db, ip_key, LOGIN_IP_MAX_FAILS, LOGIN_WINDOW_S, LOGIN_LOCKOUT_S)
         db.commit()
         flash(FLASH_GENERIC_LOGIN_ERROR, "error")
         return render_template("login.html", next=request.form.get("next") or "")
