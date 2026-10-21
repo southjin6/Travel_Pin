@@ -29,6 +29,22 @@ services:
       # so it must outlive the container.
       - travel-data:/data
     restart: unless-stopped
+    # The app writes nothing outside /data, so the root filesystem can be
+    # read-only; gunicorn still needs a writable /tmp for its worker heartbeat.
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # An unbounded log file is the classic way a small box runs out of disk;
+    # Docker's default json-file driver has no size cap at all.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   # Quick tunnel: no domain, no Cloudflare account, no inbound ports. cloudflared
   # dials *out* to Cloudflare and traffic returns down that connection, which is
@@ -43,6 +59,11 @@ services:
     image: cloudflare/cloudflared:latest
     restart: unless-stopped
     command: tunnel --no-autoupdate --url http://server:8000
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     depends_on:
       server:
         # The Dockerfile HEALTHCHECK proves the schema exists, so the tunnel
